@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "signals-engine"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas>=2.0",
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "statsmodels>=0.14",
+    "scikit-learn>=1.3",
+    "matplotlib>=3.8",
+    "plotly>=5.18",
+    "streamlit>=1.30",
+    "duckdb>=0.10",
+    "pydantic>=2.5",
+    "typer>=0.9",
+    "rich>=13.7",
+    "yfinance>=0.2.37",
+    "requests>=2.31",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4", "ruff>=0.1", "pytest-cov"]
+
+[project.scripts]
+signals = "signals_engine.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/signals_engine"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
