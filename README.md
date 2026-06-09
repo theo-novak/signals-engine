@@ -249,8 +249,6 @@ signals_engine/
 │   └── test_backtest.py                # IC, backtest engine, rebalance date generation
 ├── scripts/
 │   └── download_data.py                # SEC EDGAR + yfinance → DuckDB + CSV
-├── notebooks/
-│   └── factor_research.ipynb           # Research memo: data → signals → backtest
 ├── data/                               # Git-ignored; populated by download_data.py
 ├── dashboard.html                      # Stlite (browser-side) demo dashboard
 ├── .env.example                        # Configuration template

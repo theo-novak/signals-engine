@@ -93,7 +93,6 @@ with tab1:
                  f"({prices_wide.index[0]} → {prices_wide.index[-1]})")
         st.line_chart(
             prices_wide.div(prices_wide.iloc[0]).dropna(how="all"),
-            width="stretch",
         )
 
 # ── Tab 2: Factor Explorer ────────────────────────────────────────────────────

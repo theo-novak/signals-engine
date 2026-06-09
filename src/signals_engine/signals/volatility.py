@@ -60,17 +60,17 @@ def idiosyncratic_vol(
     start_i = max(end_i - window, 0)
     rets = np.log(prices.iloc[start_i : end_i + 1] / prices.iloc[start_i : end_i + 1].shift(1)).dropna()
 
-    mkt = rets[[market_ticker]].values
+    mkt = rets[[market_ticker]].values  # shape (N, 1) — correct X for LinearRegression
     result: dict[str, float] = {}
     for col in rets.columns:
         if col == market_ticker:
             continue
-        y = rets[col].values.reshape(-1, 1)
-        valid = np.isfinite(y.ravel()) & np.isfinite(mkt.ravel())
+        y = rets[col].values  # 1-D (N,)
+        valid = np.isfinite(y) & np.isfinite(mkt.ravel())
         if valid.sum() < 20:
             continue
         lr = LinearRegression().fit(mkt[valid], y[valid])
-        resid = y[valid] - lr.predict(mkt[valid])
+        resid = y[valid] - lr.predict(mkt[valid]).ravel()
         result[col] = float(np.std(resid) * np.sqrt(_TRADING_DAYS))
 
     raw = pd.Series(result, name="idiosyncratic_vol")

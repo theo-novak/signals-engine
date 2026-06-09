@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+  <title>Signals Engine Dashboard</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@stlite/mountable@0.73.0/build/stlite.css" />
+  <style>
+    html, body, #root { height: 100%; margin: 0; padding: 0; overflow: hidden; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="https://cdn.jsdelivr.net/npm/@stlite/mountable@0.73.0/build/stlite.js"></script>
+  <script>
+stlite.mount(
+  {
+    requirements: ["plotly", "scipy"],
+    entrypoint: "streamlit_app.py",
+    files: {
+      "streamlit_app.py": `
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+from scipy.stats import spearmanr
+
+# set_page_config must be the first Streamlit command — before any st.cache_data calls
+st.set_page_config(page_title="Signals Engine", layout="wide", page_icon="📊")
+
+# ── Synthetic data ────────────────────────────────────────────────────────────
+
+_TICKERS = [
+    "AAPL","MSFT","GOOGL","AMZN","META",
+    "JPM","BAC","WFC","JNJ","UNH",
+    "XOM","CVX","PG","KO","PEP",
+    "HD","LOW","CAT","GE","MMM",
+]
+_N_DAYS = 756
+
+@st.cache_data
+def _make_prices():
+    rng = np.random.default_rng(42)
+    dates = pd.bdate_range("2022-01-03", periods=_N_DAYS)
+    log_rets = rng.normal(0.0003, 0.015, (_N_DAYS, len(_TICKERS)))
+    starts = rng.uniform(50, 500, len(_TICKERS))
+    prices = starts * np.exp(np.cumsum(log_rets, axis=0))
+    return pd.DataFrame(prices, index=dates, columns=_TICKERS)
+
+@st.cache_data
+def _make_fundamentals():
+    rng = np.random.default_rng(42)
+    rows = []
+    for t in _TICKERS:
+        rev_base = rng.uniform(1e9, 5e10)
+        ta_base  = rev_base * rng.uniform(2.0, 5.0)
+        for year in range(2019, 2024):
+            rev = rev_base * (1.0 + rng.uniform(-0.05, 0.20))
+            ni  = rev * rng.uniform(0.05, 0.25)
+            ta  = ta_base * (1.0 + rng.uniform(-0.03, 0.15))
+            rows.append({
+                "ticker":              t,
+                "period_end":          pd.Timestamp(f"{year}-12-31"),
+                "revenue":             rev,
+                "net_income":          ni,
+                "eps_basic":           ni / float(rng.integers(int(5e8), int(2e9))),
+                "total_assets":        ta,
+                "total_debt":          ta * rng.uniform(0.10, 0.50),
+                "stockholders_equity": ta * rng.uniform(0.20, 0.60),
+                "operating_cash_flow": ni * rng.uniform(0.80, 1.40),
+            })
+    return pd.DataFrame(rows)
+
+_PRICES_ALL = _make_prices()
+_FUND_ALL   = _make_fundamentals()
+
+# ── Signal helpers ────────────────────────────────────────────────────────────
+
+def _latest_as_of(fund, as_of_ts):
+    sub = fund[fund["period_end"] <= as_of_ts].copy()
+    if sub.empty:
+        return pd.DataFrame()
+    idx = sub.groupby("ticker")["period_end"].idxmax()
+    return sub.loc[idx].set_index("ticker")
+
+def sig_earnings_yield(fund, prices, as_of_ts):
+    latest = _latest_as_of(fund, as_of_ts)
+    if latest.empty:
+        return pd.Series(dtype=float, name="earnings_yield")
+    price_row = prices[prices.index <= as_of_ts].iloc[-1]
+    eps = latest["eps_basic"].dropna()
+    common = eps.index.intersection(price_row.index)
+    p = price_row[common].replace(0.0, np.nan)
+    return (eps[common] / p).rename("earnings_yield")
+
+def sig_roa(fund, as_of_ts):
+    latest = _latest_as_of(fund, as_of_ts)
+    if latest.empty:
+        return pd.Series(dtype=float, name="return_on_assets")
+    return (latest["net_income"] /
+            latest["total_assets"].replace(0.0, np.nan)).rename("return_on_assets")
+
+def sig_accruals(fund, as_of_ts):
+    latest = _latest_as_of(fund, as_of_ts)
+    if latest.empty:
+        return pd.Series(dtype=float, name="accruals")
+    raw = ((latest["net_income"] - latest["operating_cash_flow"]) /
+           latest["total_assets"].replace(0.0, np.nan))
+    return (-raw).rename("accruals")
+
+def sig_leverage(fund, as_of_ts):
+    latest = _latest_as_of(fund, as_of_ts)
+    if latest.empty:
+        return pd.Series(dtype=float, name="leverage")
+    raw = latest["total_debt"].fillna(0.0) / latest["total_assets"].replace(0.0, np.nan)
+    return (-raw).rename("leverage")
+
+def sig_asset_growth(fund, as_of_ts):
+    sub = fund[fund["period_end"] <= as_of_ts].dropna(subset=["total_assets"]).sort_values("period_end")
+    result = {}
+    for ticker, grp in sub.groupby("ticker"):
+        g = grp.tail(2)
+        if len(g) < 2:
+            continue
+        a0, a1 = g["total_assets"].iloc[0], g["total_assets"].iloc[1]
+        if a0 > 0:
+            result[ticker] = (a1 - a0) / a0
+    return pd.Series(result, name="asset_growth")
+
+def sig_sales_growth(fund, as_of_ts):
+    sub = fund[fund["period_end"] <= as_of_ts].dropna(subset=["revenue"]).sort_values("period_end")
+    result = {}
+    for ticker, grp in sub.groupby("ticker"):
+        g = grp.tail(2)
+        if len(g) < 2:
+            continue
+        r0, r1 = g["revenue"].iloc[0], g["revenue"].iloc[1]
+        if r0 > 0:
+            result[ticker] = (r1 - r0) / r0
+    return pd.Series(result, name="sales_growth")
+
+def sig_momentum(prices, as_of_ts, skip=21, form=252):
+    mask  = prices.index <= as_of_ts
+    if mask.sum() < form + skip + 1:
+        return pd.Series(dtype=float, name="momentum_12_1")
+    end_i  = int(np.where(mask)[0][-1])
+    ne     = max(end_i - skip, 0)
+    ns     = max(ne - form, 0)
+    return (prices.iloc[ne] / prices.iloc[ns].replace(0.0, np.nan) - 1.0).rename("momentum_12_1")
+
+def sig_rvol(prices, as_of_ts, window=63):
+    mask = prices.index <= as_of_ts
+    if mask.sum() < window + 1:
+        return pd.Series(dtype=float, name="realized_vol")
+    end_i   = int(np.where(mask)[0][-1])
+    start_i = max(end_i - window, 0)
+    log_r = np.log(prices.iloc[start_i:end_i+1] /
+                   prices.iloc[start_i:end_i+1].shift(1)).dropna()
+    return (log_r.std() * np.sqrt(252)).rename("realized_vol")
+
+def all_signals(fund, prices, as_of_ts):
+    parts = [
+        sig_earnings_yield(fund, prices, as_of_ts),
+        sig_roa(fund, as_of_ts),
+        sig_accruals(fund, as_of_ts),
+        sig_leverage(fund, as_of_ts),
+        sig_asset_growth(fund, as_of_ts),
+        sig_sales_growth(fund, as_of_ts),
+        sig_momentum(prices, as_of_ts),
+        sig_rvol(prices, as_of_ts),
+    ]
+    return pd.concat(parts, axis=1).dropna(how="all")
+
+def zscore(s):
+    s = s.dropna()
+    s = s.clip(s.mean() - 3*s.std(), s.mean() + 3*s.std())
+    std = s.std()
+    return (s - s.mean()) / std if std > 0 else s * 0.0
+
+def composite(df, weights):
+    parts = []
+    for col, w in weights.items():
+        if col in df.columns:
+            parts.append(zscore(df[col]) * w)
+    if not parts:
+        return pd.Series(dtype=float)
+    return pd.concat(parts, axis=1).sum(axis=1, min_count=1)
+
+# ── Backtest helpers ──────────────────────────────────────────────────────────
+
+def fwd_returns(prices, horizon):
+    return prices.shift(-horizon) / prices - 1.0
+
+def ic_spearman(sig, fwd):
+    common = sig.dropna().index.intersection(fwd.dropna().index)
+    if len(common) < 5:
+        return np.nan
+    r, _ = spearmanr(sig[common], fwd[common])
+    return float(r)
+
+def run_backtest(fund, prices, signal_fn, rebal_dates, horizon=21):
+    fwd = fwd_returns(prices, horizon)
+    ic_vals, spread_vals, long_vals, short_vals = {}, {}, {}, {}
+    prev_long: set = set()
+    turnovers = []
+    for d in rebal_dates:
+        ts = pd.Timestamp(d)
+        try:
+            sig = signal_fn(fund, prices, ts)
+        except Exception:
+            continue
+        if sig.dropna().empty:
+            continue
+        fwd_mask = fwd.index <= ts
+        if not fwd_mask.any():
+            continue
+        fwd_row = fwd[fwd_mask].iloc[-1].dropna()
+        common = sig.dropna().index.intersection(fwd_row.index)
+        if len(common) < 10:
+            continue
+        ic_vals[d] = ic_spearman(sig[common], fwd_row[common])
+        try:
+            q = pd.qcut(sig[common], 5, labels=False, duplicates="drop") + 1
+            long_vals[d]   = float(fwd_row[common][q == q.max()].mean())
+            short_vals[d]  = float(fwd_row[common][q == q.min()].mean())
+            spread_vals[d] = long_vals[d] - short_vals[d]
+            curr = set(sig[common][q == q.max()].index.tolist())
+            if prev_long:
+                u = prev_long | curr
+                if u:
+                    turnovers.append(len(prev_long.symmetric_difference(curr)) / len(u))
+            prev_long = curr
+        except Exception:
+            pass
+    ic_s = pd.Series(ic_vals, name="ic")
+    sp_s = pd.Series(spread_vals, name="spread")
+    return ic_s, sp_s, pd.Series(long_vals), pd.Series(short_vals), np.mean(turnovers) if turnovers else np.nan
+
+# ── Plot helpers ──────────────────────────────────────────────────────────────
+
+def plot_ic_bar(ic_s, name):
+    if ic_s.dropna().empty:
+        return go.Figure()
+    roll = ic_s.rolling(6, min_periods=1).mean()
+    colors = ["#00CC96" if v >= 0 else "#EF553B" for v in ic_s.values]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=ic_s.index.astype(str), y=ic_s.values,
+                         marker_color=colors, opacity=0.7, name="Monthly IC"))
+    fig.add_trace(go.Scatter(x=roll.index.astype(str), y=roll.values,
+                             line=dict(color="#636EFA", width=2), name="6-month rolling"))
+    fig.add_hline(y=0, line_dash="dot", line_color="grey")
+    fig.update_layout(title=f"IC — {name}", xaxis_title="Date",
+                      yaxis_title="Spearman IC", template="plotly_white",
+                      legend=dict(orientation="h", y=1.02))
+    return fig
+
+def plot_ic_heatmap(ic_s, name):
+    if ic_s.dropna().empty:
+        return go.Figure()
+    _MON = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    df = pd.DataFrame({
+        "ic":    ic_s.values,
+        "year":  [d.year  for d in ic_s.index],
+        "month": [d.month for d in ic_s.index],
+    })
+    pivot = df.pivot(index="year", columns="month", values="ic")
+    pivot.columns = [_MON[m-1] for m in pivot.columns]
+    fig = go.Figure(go.Heatmap(
+        z=pivot.values, x=pivot.columns.tolist(),
+        y=[str(y) for y in pivot.index],
+        colorscale="RdYlGn", zmid=0,
+        text=np.round(pivot.values, 2), texttemplate="%{text}",
+        colorbar=dict(title="IC"),
+    ))
+    fig.update_layout(title=f"IC Heatmap — {name}", template="plotly_white")
+    return fig
+
+def plot_quantile_bars(sig, fwd_row, name, n=5):
+    common = sig.dropna().index.intersection(fwd_row.dropna().index)
+    if len(common) < n * 2:
+        return go.Figure()
+    try:
+        q = pd.qcut(sig[common], n, labels=[f"Q{i+1}" for i in range(n)], duplicates="drop")
+    except Exception:
+        return go.Figure()
+    means = fwd_row[common].groupby(q).mean() * 100
+    colors = ["#00CC96" if v >= 0 else "#EF553B" for v in means.values]
+    fig = go.Figure(go.Bar(x=means.index.astype(str), y=means.values, marker_color=colors))
+    fig.update_layout(title=f"Mean Forward Return by Quantile — {name}",
+                      xaxis_title="Signal Quantile", yaxis_title="Mean Return (%)",
+                      template="plotly_white")
+    return fig
+
+def plot_exposure_heatmap(df):
+    z = (df - df.mean()) / df.std().replace(0.0, 1.0)
+    fig = go.Figure(go.Heatmap(
+        z=z.values, x=z.columns.tolist(), y=z.index.tolist(),
+        colorscale="RdBu", zmid=0, colorbar=dict(title="Z"),
+    ))
+    fig.update_layout(title="Factor Exposures (z-scored)",
+                      xaxis_title="Signal", yaxis_title="Ticker",
+                      template="plotly_white", height=500)
+    return fig
+
+# ── Page ──────────────────────────────────────────────────────────────────────
+
+st.title("📊 Cross-Sectional Signals Engine")
+st.caption("Synthetic 20-stock universe · 6 fundamental signals · momentum · IC backtest")
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+
+with st.sidebar:
+    st.header("Configuration")
+    selected = st.multiselect("Universe", _TICKERS, default=_TICKERS)
+    if not selected:
+        selected = _TICKERS
+
+    as_of_date = st.date_input("Signal date (as-of)", value=pd.Timestamp("2024-06-28").date())
+    as_of_ts   = pd.Timestamp(as_of_date)
+
+    st.divider()
+    st.subheader("Backtest")
+    bt_start = st.date_input("Start", value=pd.Timestamp("2020-01-01").date())
+    bt_end   = st.date_input("End",   value=pd.Timestamp("2024-06-28").date())
+    horizon  = st.selectbox("Forward return horizon (days)", [21, 63, 126], index=0)
+    n_q      = st.slider("Quantiles", 3, 5, 5)
+
+prices = _PRICES_ALL[selected]
+fund   = _FUND_ALL[_FUND_ALL["ticker"].isin(selected)].copy()
+
+# ── Tabs ──────────────────────────────────────────────────────────────────────
+
+tab1, tab2, tab3 = st.tabs(["📊 Universe & Data", "🔍 Factor Explorer", "📈 Backtester"])
+
+# ══ TAB 1 — UNIVERSE & DATA ═══════════════════════════════════════════════════
+
+with tab1:
+    st.subheader("Fundamentals Coverage")
+    cov = (fund.groupby("ticker")
+           .agg(
+               periods    =("period_end", "count"),
+               earliest   =("period_end", "min"),
+               latest     =("period_end", "max"),
+               has_revenue=("revenue",    lambda x: int(x.notna().sum())),
+               has_eps    =("eps_basic",  lambda x: int(x.notna().sum())),
+               has_ocf    =("operating_cash_flow", lambda x: int(x.notna().sum())),
+           )
+           .reset_index())
+    cov["earliest"] = cov["earliest"].dt.strftime("%Y")
+    cov["latest"]   = cov["latest"].dt.strftime("%Y")
+    st.dataframe(cov.set_index("ticker"), use_container_width=True)
+
+    st.subheader("Normalised Price History  (rebased to 100)")
+    rebased = prices / prices.iloc[0] * 100
+    fig_p = go.Figure()
+    palette = ["#636EFA","#EF553B","#00CC96","#AB63FA","#FFA15A",
+               "#19D3F3","#FF6692","#B6E880","#FF97FF","#FECB52",
+               "#636EFA","#EF553B","#00CC96","#AB63FA","#FFA15A",
+               "#19D3F3","#FF6692","#B6E880","#FF97FF","#FECB52"]
+    for i, col in enumerate(rebased.columns):
+        fig_p.add_trace(go.Scatter(
+            x=rebased.index.astype(str), y=rebased[col],
+            name=col, line=dict(color=palette[i % len(palette)], width=1.2),
+        ))
+    fig_p.update_layout(xaxis_title="Date", yaxis_title="Rebased Price",
+                        template="plotly_white",
+                        legend=dict(orientation="h", yanchor="bottom", y=1.01, font=dict(size=10)))
+    st.plotly_chart(fig_p, use_container_width=True)
+
+# ══ TAB 2 — FACTOR EXPLORER ═══════════════════════════════════════════════════
+
+with tab2:
+    st.subheader(f"Signal Values — {as_of_date}")
+    with st.spinner("Computing signals..."):
+        sigs = all_signals(fund, prices, as_of_ts)
+
+    if sigs.empty:
+        st.warning("No signals computed. Try a later date.")
+    else:
+        st.dataframe(
+            sigs.style.format("{:.4f}", na_rep="—"),
+            use_container_width=True,
+        )
+
+        st.subheader("Factor Exposure Heatmap")
+        factor_cols = [c for c in sigs.columns if c != "realized_vol"]
+        if factor_cols:
+            st.plotly_chart(plot_exposure_heatmap(sigs[factor_cols].dropna(how="all")),
+                            use_container_width=True)
+
+        st.subheader("Composite Signal Scores")
+        comp_weights = {
+            "Quality-Value":    {"earnings_yield": 1.0, "return_on_assets": 1.0,
+                                 "accruals": 1.0, "leverage": 0.5, "asset_growth": -0.5},
+            "Fundamentals":     {"earnings_yield": 1.0, "return_on_assets": 1.0,
+                                 "accruals": 0.5, "leverage": 0.5},
+            "Momentum-Quality": {"momentum_12_1": 1.0, "return_on_assets": 0.5,
+                                 "accruals": 0.5},
+        }
+        comp_df = pd.DataFrame({
+            name: composite(sigs, w) for name, w in comp_weights.items()
+        }).dropna(how="all")
+        if not comp_df.empty:
+            st.dataframe(
+                comp_df.sort_values("Quality-Value", ascending=False, na_position="last")
+                .style.format("{:.3f}", na_rep="—"),
+                use_container_width=True,
+            )
+
+# ══ TAB 3 — BACKTESTER ════════════════════════════════════════════════════════
+
+with tab3:
+    st.subheader("Signal Backtester")
+
+    _SIGNAL_OPTIONS = {
+        "earnings_yield":   lambda f, p, ts: sig_earnings_yield(f, p, ts),
+        "return_on_assets": lambda f, p, ts: sig_roa(f, ts),
+        "accruals":         lambda f, p, ts: sig_accruals(f, ts),
+        "leverage":         lambda f, p, ts: sig_leverage(f, ts),
+        "asset_growth":     lambda f, p, ts: sig_asset_growth(f, ts),
+        "sales_growth":     lambda f, p, ts: sig_sales_growth(f, ts),
+        "momentum_12_1":    lambda f, p, ts: sig_momentum(p, ts),
+    }
+
+    chosen = st.multiselect(
+        "Signals to backtest", list(_SIGNAL_OPTIONS.keys()),
+        default=["earnings_yield", "return_on_assets", "momentum_12_1"],
+    )
+
+    if st.button("Run Backtest") and chosen:
+        rebal_dates = list(pd.date_range(str(bt_start), str(bt_end), freq="MS"))
+
+        summary_rows = []
+        results_map  = {}
+
+        for sig_name in chosen:
+            with st.spinner(f"Running {sig_name}..."):
+                ic_s, sp_s, long_s, short_s, to = run_backtest(
+                    fund, prices, _SIGNAL_OPTIONS[sig_name], rebal_dates, horizon=horizon,
+                )
+            results_map[sig_name] = (ic_s, sp_s, long_s, short_s)
+            cum  = float((1 + sp_s.fillna(0)).prod() - 1)
+            icir = float(ic_s.mean() / ic_s.std()) if ic_s.std() > 0 else float("nan")
+            summary_rows.append({
+                "Signal":      sig_name,
+                "Mean IC":     f"{ic_s.mean():.4f}" if not ic_s.empty else "—",
+                "ICIR":        f"{icir:.2f}" if pd.notna(icir) else "—",
+                "Hit Rate":    f"{(ic_s > 0).mean():.1%}" if not ic_s.empty else "—",
+                "Cum. Spread": f"{cum:.1%}",
+                "Turnover":    f"{to:.1%}" if pd.notna(to) else "—",
+            })
+
+        st.dataframe(pd.DataFrame(summary_rows).set_index("Signal"), use_container_width=True)
+
+        # Cumulative spread overlay
+        fig_ov = go.Figure()
+        palette_bt = ["#636EFA","#EF553B","#00CC96","#AB63FA","#FFA15A","#19D3F3","#FF6692"]
+        for i, sig_name in enumerate(chosen):
+            _, sp_s, _, _ = results_map[sig_name]
+            if sp_s.dropna().empty:
+                continue
+            cum = (1 + sp_s.fillna(0)).cumprod() - 1
+            fig_ov.add_trace(go.Scatter(
+                x=cum.index.astype(str), y=cum.values * 100,
+                name=sig_name, line=dict(color=palette_bt[i % len(palette_bt)], width=1.8),
+            ))
+        fig_ov.add_hline(y=0, line_dash="dot", line_color="grey")
+        fig_ov.update_layout(
+            title="Cumulative Long-Short Spread Returns",
+            xaxis_title="Date", yaxis_title="Cumulative Return (%)",
+            template="plotly_white",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(fig_ov, use_container_width=True)
+
+        # Per-signal detail panels
+        for sig_name in chosen:
+            ic_s, sp_s, long_s, short_s = results_map[sig_name]
+            with st.expander(f"Detail — {sig_name}"):
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.plotly_chart(plot_ic_bar(ic_s, sig_name), use_container_width=True)
+                with c2:
+                    st.plotly_chart(plot_ic_heatmap(ic_s, sig_name), use_container_width=True)
+
+                try:
+                    sig_row  = _SIGNAL_OPTIONS[sig_name](fund, prices, as_of_ts)
+                    fwd_row  = fwd_returns(prices, horizon)
+                    fwd_mask = fwd_row.index <= as_of_ts
+                    if fwd_mask.any() and not sig_row.dropna().empty:
+                        fwd_at = fwd_row[fwd_mask].iloc[-1]
+                        st.plotly_chart(plot_quantile_bars(sig_row, fwd_at, sig_name, n=n_q),
+                                        use_container_width=True)
+                except Exception:
+                    pass
+`,
+    },
+  },
+  document.getElementById("root")
+);
+  </script>
+</body>
+</html>
